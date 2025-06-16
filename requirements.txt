@@ -1,0 +1,318 @@
+streamlit
+pandas
+plotly
+
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import numpy as np
+from datetime import datetime, timedelta
+from geopy.distance import geodesic
+
+st.set_page_config(page_title="Fleet Analysis Platform", layout="wide")
+st.title("🚗 Fleet Operations Data Analysis")
+
+st.sidebar.header("📂 Upload Your Data")
+
+# Upload files
+trips_file = st.sidebar.file_uploader("Upload Trips CSV", type="csv")
+drivers_file = st.sidebar.file_uploader("Upload Drivers CSV", type="csv")
+vehicles_file = st.sidebar.file_uploader("Upload Vehicles CSV", type="csv")
+operations_file = st.sidebar.file_uploader("Upload Operations CSV (Clients and Hubs)", type="csv")
+geofence_file = st.sidebar.file_uploader("Upload Geofence CSV", type="csv")
+
+@st.cache_data
+def load_csv(file):
+    return pd.read_csv(file)
+
+def safe_load(file):
+    try:
+        return load_csv(file)
+    except Exception as e:
+        st.error(f"Failed to load file: {e}")
+        return None
+
+if trips_file and drivers_file and vehicles_file:
+    trips_df = safe_load(trips_file)
+    drivers_df = safe_load(drivers_file)
+    vehicles_df = safe_load(vehicles_file)
+    operations_df = safe_load(operations_file) if operations_file else None
+    geofence_df = safe_load(geofence_file) if geofence_file else None
+
+    # Convert date columns if exist
+    if trips_df is not None:
+        trips_df['Trip Date'] = pd.to_datetime(trips_df['Trip Date'], errors='coerce')
+        if 'Start Time' in trips_df.columns:
+            trips_df['Trip DateTime'] = pd.to_datetime(trips_df['Trip Date'].dt.strftime('%Y-%m-%d') + ' ' + trips_df['Start Time'], errors='coerce')
+
+    st.sidebar.success("All required files uploaded!")
+    st.sidebar.divider()
+
+    analysis_option = st.sidebar.selectbox(
+        "Select Analysis Type",
+        [
+            "Underutilized vehicles",
+            "Allocated vs available vehicles",
+            "High idle time (vehicle or driver)",
+            "Peak usage hours or days",
+            "Match vehicle types to trip lengths",
+            "Poor vehicle performance for clients",
+            "High/low driver trip counts or duty time",
+            "Long trip duration vs expected distance",
+            "Clients with low/high vehicle usage",
+            "Hub-client mismatches",
+            "Weekly/monthly trip volume trends",
+            "Seasonal or weekday/weekend usage",
+            "Carbon Tracking (EV)"
+        ]
+    )
+
+    st.subheader(f"Analysis: {analysis_option}")
+
+    # === ANALYSES === #
+
+    # 1. Underutilized vehicles
+    if analysis_option == "Underutilized vehicles":
+        st.info("Vehicles with < 3 trips or < 100 km distance in last 7 days")
+        date_cutoff = datetime.now() - timedelta(days=7)
+        filtered = trips_df[trips_df['Trip Date'] >= date_cutoff]
+
+        summary = filtered.groupby('Vehicle ID').agg({
+            'Trip ID': 'count',
+            'Distance': 'sum'
+        }).reset_index().rename(columns={'Trip ID': 'Trips', 'Distance': 'Total Distance (km)'})
+
+        underutilized = summary[
+            (summary['Trips'] < 3) | (summary['Total Distance (km)'] < 100)
+        ]
+
+        st.dataframe(underutilized)
+        csv = underutilized.to_csv(index=False).encode('utf-8')
+        st.download_button("Download CSV", csv, file_name="underutilized_vehicles.csv")
+
+        fig = px.histogram(summary, x='Trips', nbins=20, title="Trip Count Distribution")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 2. Allocated vs available vehicles
+    elif analysis_option == "Allocated vs available vehicles":
+        allocated = vehicles_df[vehicles_df['Status'].str.lower() == 'allocated']
+        available = vehicles_df[vehicles_df['Status'].str.lower() == 'available']
+
+        st.metric("Allocated Vehicles", len(allocated))
+        st.metric("Available Vehicles", len(available))
+
+        usage = trips_df.groupby('Vehicle ID').size().reset_index(name='Trip Count')
+        merged = pd.merge(vehicles_df, usage, how='left', left_on='Vehicle ID', right_on='Vehicle ID')
+        merged['Trip Count'] = merged['Trip Count'].fillna(0)
+        st.dataframe(merged[['Vehicle ID', 'Status', 'Trip Count']])
+
+        allocated_pct = (len(allocated) / max(len(available), 1)) * 100
+        st.write(f"**Percentage of Allocated Vehicles relative to Available:** {allocated_pct:.2f}%")
+
+    # 3. High idle time (vehicle or driver)
+    elif analysis_option == "High idle time (vehicle or driver)":
+        if 'Trip DateTime' not in trips_df.columns:
+            st.error("Trip DateTime data (combined Trip Date and Start Time) is required for this analysis.")
+        else:
+            trips_sorted = trips_df.sort_values(['Vehicle ID', 'Trip DateTime'])
+            trips_sorted['Idle Time (hrs)'] = trips_sorted.groupby('Vehicle ID')['Trip DateTime'].diff().dt.total_seconds() / 3600
+            idle_gaps = trips_sorted[trips_sorted['Idle Time (hrs)'] > 6]
+
+            st.write("Idle gaps > 6 hours between trips for vehicles:")
+            st.dataframe(idle_gaps[['Vehicle ID', 'Trip ID', 'Idle Time (hrs)']])
+
+            csv = idle_gaps.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Idle Time Gaps CSV", csv, file_name="idle_time_gaps.csv")
+
+    # 4. Peak usage hours or days
+    elif analysis_option == "Peak usage hours or days":
+        trips_df['Hour'] = trips_df['Trip DateTime'].dt.hour if 'Trip DateTime' in trips_df.columns else trips_df['Trip Date'].dt.hour
+        trips_df['DayOfWeek'] = trips_df['Trip DateTime'].dt.day_name() if 'Trip DateTime' in trips_df.columns else trips_df['Trip Date'].dt.day_name()
+
+        hour_counts = trips_df.groupby('Hour').size().reset_index(name='Trips')
+        day_counts = trips_df.groupby('DayOfWeek').size().reindex(
+            ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']).reset_index(name='Trips')
+
+        fig1 = px.bar(hour_counts, x='Hour', y='Trips', title="Trips by Hour of Day")
+        fig2 = px.bar(day_counts, x='DayOfWeek', y='Trips', title="Trips by Day of Week")
+
+        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # 5. Match vehicle types to trip lengths
+    elif analysis_option == "Match vehicle types to trip lengths":
+        merged = pd.merge(trips_df, vehicles_df[['Vehicle ID', 'Vehicle Type']], on='Vehicle ID', how='left')
+        merged['Distance Bin'] = pd.cut(merged['Distance'], bins=[0, 10, 50, 1000], labels=['0-10 km', '10-50 km', '50+ km'])
+
+        avg_distance = merged.groupby(['Vehicle Type', 'Distance Bin']).agg({'Distance': 'mean', 'Trip ID': 'count'}).reset_index()
+        avg_distance.rename(columns={'Trip ID': 'Trip Count'}, inplace=True)
+
+        st.dataframe(avg_distance)
+
+        fig = px.bar(avg_distance, x='Vehicle Type', y='Trip Count', color='Distance Bin', barmode='group',
+                     title='Trip Counts by Vehicle Type and Distance Bin')
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 6. Poor vehicle performance for clients
+    elif analysis_option == "Poor vehicle performance for clients":
+        if geofence_df is None:
+            st.warning("Geofence data not uploaded - performance flags may be limited.")
+        # Count cancellations or late trips, use geofence violations if available
+        trips_df['Cancelled'] = trips_df['Status'].str.lower() == 'cancelled'
+        trips_df['Late'] = trips_df.get('Late Return', False)
+
+        grp = trips_df.groupby(['Vehicle ID', 'Client']).agg({
+            'Cancelled': 'sum',
+            'Late': 'sum',
+            'Trip ID': 'count'
+        }).reset_index()
+
+        if geofence_df is not None:
+            violations = geofence_df.groupby('Vehicle ID').size().reset_index(name='Violation Count')
+            grp = grp.merge(violations, how='left', on='Vehicle ID')
+            grp['Violation Count'] = grp['Violation Count'].fillna(0)
+
+        flagged = grp[(grp['Cancelled'] > 0) | (grp['Late'] > 0) | (grp.get('Violation Count', 0) > 0)]
+        st.dataframe(flagged)
+
+        csv = flagged.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Vehicle-Client Performance CSV", csv, file_name="vehicle_client_performance.csv")
+
+    # 7. High/low driver trip counts or duty time
+    elif analysis_option == "High/low driver trip counts or duty time":
+        trips_per_driver = trips_df.groupby('Driver ID').agg({'Trip ID': 'count'}).rename(columns={'Trip ID': 'Trip Count'})
+        if 'Duty Hours' in drivers_df.columns:
+            driver_hours = drivers_df[['Driver ID', 'Duty Hours']]
+            driver_stats = trips_per_driver.merge(driver_hours, on='Driver ID', how='left')
+        else:
+            driver_stats = trips_per_driver
+            driver_stats['Duty Hours'] = np.nan
+
+        st.dataframe(driver_stats)
+
+        # Show top and bottom 10% drivers by trip count
+        trip_counts = driver_stats['Trip Count']
+        top_threshold = trip_counts.quantile(0.9)
+        bottom_threshold = trip_counts.quantile(0.1)
+
+        st.write("Drivers with High Trip Counts (top 10%)")
+        st.dataframe(driver_stats[driver_stats['Trip Count'] >= top_threshold])
+
+        st.write("Drivers with Low Trip Counts (bottom 10%)")
+        st.dataframe(driver_stats[driver_stats['Trip Count'] <= bottom_threshold])
+
+    # 8. Long trip duration vs expected distance
+    elif analysis_option == "Long trip duration vs expected distance":
+        # Expected average speed assumed 40 km/h
+        trips_df['Expected Duration (hrs)'] = trips_df['Distance'] / 40
+        trips_df['Duration'] = pd.to_timedelta(trips_df['Duration'])
+        trips_df['Actual Duration (hrs)'] = trips_df['Duration'].dt.total_seconds() / 3600
+        trips_df['Duration Ratio'] = trips_df['Actual Duration (hrs)'] / trips_df['Expected Duration (hrs)']
+
+        long_duration = trips_df[trips_df['Duration Ratio'] > 2].sort_values('Duration Ratio', ascending=False)
+
+        st.dataframe(long_duration[['Trip ID', 'Vehicle ID', 'Distance', 'Actual Duration (hrs)', 'Expected Duration (hrs)', 'Duration Ratio']])
+
+        csv = long_duration.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Long Duration Trips CSV", csv, file_name="long_duration_trips.csv")
+
+        fig = px.scatter(trips_df, x='Distance', y='Actual Duration (hrs)', color='Duration Ratio',
+                         title='Trip Distance vs Actual Duration (Color = Duration Ratio)')
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 9. Clients with low/high vehicle usage
+    elif analysis_option == "Clients with low/high vehicle usage":
+        usage = trips_df.groupby('Client').agg({
+            'Trip ID': 'count',
+            'Distance': 'sum'
+        }).rename(columns={'Trip ID': 'Trips', 'Distance': 'Total Distance (km)'}).reset_index()
+
+        avg_trips = usage['Trips'].mean()
+        avg_dist = usage['Total Distance (km)'].mean()
+
+        low_usage = usage[(usage['Trips'] < avg_trips * 0.5) | (usage['Total Distance (km)'] < avg_dist * 0.5)]
+        high_usage = usage[(usage['Trips'] > avg_trips * 1.5) | (usage['Total Distance (km)'] > avg_dist * 1.5)]
+
+        st.write("Clients with Low Usage")
+        st.dataframe(low_usage)
+        st.write("Clients with High Usage")
+        st.dataframe(high_usage)
+
+    # 10. Hub-client mismatches
+    elif analysis_option == "Hub-client mismatches":
+        if operations_df is None:
+            st.error("Operations (Clients/Hubs) file required for this analysis.")
+        else:
+            # Expecting operations_df to have Client, Hub, Client Location, Hub Location columns
+            # Assuming hubs and clients have lat/lon columns
+            ops = operations_df.copy()
+            if not {'Client Lat', 'Client Lon', 'Hub Lat', 'Hub Lon'}.issubset(ops.columns):
+                st.error("Operations file must include Client Lat, Client Lon, Hub Lat, Hub Lon columns.")
+            else:
+                def dist_km(row):
+                    c = (row['Client Lat'], row['Client Lon'])
+                    h = (row['Hub Lat'], row['Hub Lon'])
+                    return geodesic(c, h).km
+
+                ops['Client-Hub Distance (km)'] = ops.apply(dist_km, axis=1)
+
+                mismatch_threshold = 50  # km threshold for mismatch
+                mismatches = ops[ops['Client-Hub Distance (km)'] > mismatch_threshold]
+
+                st.dataframe(mismatches)
+                csv = mismatches.to_csv(index=False).encode('utf-8')
+                st.download_button("Download Hub-Client Mismatches CSV", csv, file_name="hub_client_mismatches.csv")
+
+    # 11. Weekly/monthly trip volume trends
+    elif analysis_option == "Weekly/monthly trip volume trends":
+        trips_df['Week'] = trips_df['Trip Date'].dt.isocalendar().week
+        trips_df['Month'] = trips_df['Trip Date'].dt.to_period('M').astype(str)
+
+        weekly = trips_df.groupby('Week').size().reset_index(name='Trips')
+        monthly = trips_df.groupby('Month').size().reset_index(name='Trips')
+
+        fig_week = px.line(weekly, x='Week', y='Trips', title='Weekly Trip Volumes')
+        fig_month = px.line(monthly, x='Month', y='Trips', title='Monthly Trip Volumes')
+
+        st.plotly_chart(fig_week, use_container_width=True)
+        st.plotly_chart(fig_month, use_container_width=True)
+
+    # 12. Seasonal or weekday/weekend usage
+    elif analysis_option == "Seasonal or weekday/weekend usage":
+        trips_df['Month'] = trips_df['Trip Date'].dt.month
+        trips_df['DayOfWeek'] = trips_df['Trip Date'].dt.dayofweek  # Monday=0
+
+        trips_df['Weekend'] = trips_df['DayOfWeek'] >= 5
+
+        monthly_usage = trips_df.groupby('Month').size().reset_index(name='Trips')
+        weekend_usage = trips_df.groupby('Weekend').size().reset_index(name='Trips')
+
+        fig_monthly = px.bar(monthly_usage, x='Month', y='Trips', title='Monthly Trip Counts')
+        fig_weekend = px.bar(weekend_usage, x='Weekend', y='Trips', title='Weekend vs Weekday Trips',
+                            labels={'Weekend': 'Is Weekend (True/False)'})
+
+        st.plotly_chart(fig_monthly, use_container_width=True)
+        st.plotly_chart(fig_weekend, use_container_width=True)
+
+    # 13. Carbon Tracking (EV)
+    elif analysis_option == "Carbon Tracking (EV)":
+        # Identify EV vehicles from vehicles_df
+        vehicles_ev = vehicles_df[vehicles_df['Vehicle Type'].str.contains('EV|Electric', case=False, na=False)]
+
+        ev_trips = trips_df[trips_df['Vehicle ID'].isin(vehicles_ev['Vehicle ID'])]
+
+        total_ev_distance = ev_trips['Distance'].sum()
+        # Assumptions: Average emission saved per km by EV = 0.2 kg CO2 (replace with your number)
+        emission_saved_per_km = 0.2
+        emission_saved = total_ev_distance * emission_saved_per_km
+
+        st.metric("Total EV Distance (km)", f"{total_ev_distance:.2f}")
+        st.metric("Estimated CO2 Emission Saved (kg)", f"{emission_saved:.2f}")
+
+        fig = px.pie(vehicles_ev['Vehicle Type'].value_counts().reset_index(),
+                     values='Vehicle Type', names='index', title='EV Vehicle Type Distribution')
+        st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.warning("Please upload all required files (Trips, Drivers, Vehicles) to begin analysis.")
